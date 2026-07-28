@@ -3,7 +3,12 @@ use serde_json::{from_str, to_string_pretty};
 use tracing::{debug, info};
 
 use crate::{domain::{LogEntry, Role, Command}, error::NodeError}; 
-use std::{collections::HashMap, fs::{read_to_string, rename, write}, path::Path};
+use std::{
+    collections::HashMap,
+    fs::{read_to_string, rename, File, OpenOptions},
+    io::Write,
+    path::Path,
+};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct HardState {
@@ -43,9 +48,19 @@ pub struct RaftState {
 impl RaftState {
     pub fn new(id: u64, peers: HashMap<u64, String>) -> Self {
         let storage_path = format!("node_{}.json", id);
-        if let Ok(hs) = Self::load_hs(&storage_path) {
-            info!("Loaded persistent state from {}", storage_path);
-            return Self::restore(id, peers, hs);
+        if Path::new(&storage_path).exists() {
+            match Self::load_hs(&storage_path) {
+                Ok(hs) => {
+                    info!("Loaded persistent state from {}", storage_path);
+                    return Self::restore(id, peers, hs);
+                }
+                Err(e) => {
+                    panic!(
+                        "Persistent Raft state exists at {} but cannot be loaded: {}",
+                        storage_path, e
+                    );
+                }
+            }
         }
 
         // dummy entry at index 0 (matches last_included_index=0)
@@ -68,7 +83,13 @@ impl RaftState {
             match_index: HashMap::new(),
             peers,
             my_id: id,
-            my_addr: format!("127.0.0.1:{}", 8000 + id),
+            /*Fix 1: 
+            with the previous IP of 127.0.0.1 the other nodes will see
+            "Oh, that guys address is 127.0.0.1" which is fatal since
+            that IP is for localhost. And now when that node want to 
+            communicate to this node, it goes to 127.0.0.1 which is itself
+            */
+            my_addr: format!("raft-{}.raft-svc.raft-system.svc.cluster.local:8000", id - 1),
             last_included_index: 0,
             last_included_term: 0,
         }
@@ -178,6 +199,7 @@ impl RaftState {
             self.current_term = new_term;
             self.voted_for = None;
             self.role = Role::Follower;
+            self.current_leader = None;
         }
     }
 
@@ -188,17 +210,25 @@ impl RaftState {
 
     pub fn become_candidate(&mut self) {
         self.role = Role::Candidate;
+        self.current_leader = None;
         self.increment_term();
     }
 
     pub fn become_leader(&mut self) {
         self.role = Role::Leader;
+        self.current_leader = Some(self.my_id);
         self.reset_leader_state();
     }
 
     pub fn reset_leader_state(&mut self) {
+        self.next_index.clear();
+        self.match_index.clear();
+
         let last_idx = self.last_log_index();
         for peer_id in self.peers.keys() {
+            if *peer_id == self.my_id {
+                continue;
+            }
             self.next_index.insert(*peer_id, last_idx + 1);
             self.match_index.insert(*peer_id, 0);
         }
@@ -246,10 +276,26 @@ impl RaftState {
         let json = to_string_pretty(&hs)
             .map_err(|e| NodeError::Internal(format!("Serialize error: {}", e)))?;
 
-        write(&tmp_path, json)
+        let mut tmp_file = OpenOptions::new()
+            .create(true)
+            .truncate(true)
+            .write(true)
+            .open(&tmp_path)
+            .map_err(|e| NodeError::Internal(format!("Open error: {}", e)))?;
+        tmp_file
+            .write_all(json.as_bytes())
             .map_err(|e| NodeError::Internal(format!("Write error: {}", e)))?;
+        tmp_file
+            .sync_all()
+            .map_err(|e| NodeError::Internal(format!("Sync error: {}", e)))?;
+
         rename(&tmp_path, &path)
             .map_err(|e| NodeError::Internal(format!("Rename error: {}", e)))?;
+
+        // Persist the directory entry created by rename as well.
+        File::open(".")
+            .and_then(|directory| directory.sync_all())
+            .map_err(|e| NodeError::Internal(format!("Directory sync error: {}", e)))?;
         
         debug!("Persisted hard state to disk (term={}, last_idx={})", hs.current_term, hs.last_included_index);
         Ok(())
@@ -297,7 +343,7 @@ impl RaftState {
             match_index: HashMap::new(),
             peers,
             my_id: id,
-            my_addr: format!("127.0.0.1:{}", 8000 + id),
+            my_addr: format!("raft-{}.raft-svc.raft-system.svc.cluster.local:8000", id - 1),
             last_included_index: hs.last_included_index,
             last_included_term: hs.last_included_term,
         }
