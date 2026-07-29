@@ -258,21 +258,31 @@ async fn main() -> anyhow::Result<()> {
     tracing::info!("Peers Config: {:?}", peers_map);
     let mut rpc_clients = std::collections::HashMap::new();
     for (id, addr_str) in &peers_map {
-        if let Ok(addr) = addr_str.parse::<SocketAddr>() {
-            tracing::info!("Connecting to peer {} at {}...", id, addr);
-            if let Ok(transport) = tarpc::serde_transport::tcp::connect(addr, Json::default).await {
-                let client = RaftServiceClient::new(client::Config::default(), transport).spawn();
-                rpc_clients.insert(*id, client);
-                tracing::info!("Connected to peer {}", id);
-            } else {
-                tracing::warn!("Failed to connect to peer {} initially: {}", id, addr_str);
-            }
+        // FIX 1: The local node already participates directly and must not get
+        // an RPC client to itself, which could produce a duplicate self-vote.
+        if *id == args.id {
+            continue;
+        }
+
+        tracing::info!("Connecting to peer {} at {}...", id, addr_str);
+        // FIX 2: Pass ConfigMap addresses directly to tarpc so Headless Service
+        // DNS names work during initial peer discovery.
+        if let Ok(transport) =
+            tarpc::serde_transport::tcp::connect(addr_str.as_str(), Json::default).await
+        {
+            let client = RaftServiceClient::new(client::Config::default(), transport).spawn();
+            rpc_clients.insert(*id, client);
+            tracing::info!("Connected to peer {}", id);
+        } else {
+            tracing::warn!("Failed to connect to peer {} initially: {}", id, addr_str);
         }
     }
 
     // --- 4. Create Actor and Bootstrap (in foreground) ---
-    let state = RaftState::new(args.id, peers_map.clone());
-    let mut actor = RaftActor::new(state, rx, tx, rpc_clients);
+    // FIX 3: Propagate fail-closed HardState/snapshot recovery errors so a pod
+    // never starts as a fresh node after losing access to persisted state.
+    let state = RaftState::new(args.id, peers_map.clone())?;
+    let mut actor = RaftActor::new(state, rx, tx, rpc_clients)?;
 
     if let Some(contact_node_address) = args.contact_node_address {
         tracing::info!("Bootstrapping to {}", contact_node_address);

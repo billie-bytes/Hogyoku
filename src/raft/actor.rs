@@ -14,7 +14,8 @@ use super::state::RaftState;
 use std::cmp::min;
 use std::time::Duration;
 use std::collections::{HashMap, BTreeMap};
-use std::net::SocketAddr;
+// Fix 21: Remove numeric-only SocketAddr usage because every peer connection
+// now resolves the ConfigMap-provided Kubernetes DNS string directly.
 use crate::raft::machine::StateMachine;
 use tarpc::{client, tokio_serde::formats::Json};
 
@@ -23,6 +24,13 @@ const ELECTION_TIMEOUT_MIN: u64 = 1500;
 const ELECTION_TIMEOUT_MAX: u64 = 3000;
 const HEARTBEAT_INTERVAL: u64 = 500;
 const RAFT_LOG_SIZE_LIMIT: u64 = 10;
+
+// Fix 1: Expose actor-owned health state without involving the API Gateway,
+// HTML, or replicated commands, so Kubernetes probes cannot grow the Raft log.
+#[derive(Debug, Clone, Copy)]
+pub struct HealthStatus {
+    pub ready: bool,
+}
 
 // Pesan yang bisa dikirim ke Actor
 pub enum ActorMsg {
@@ -87,6 +95,11 @@ pub enum ActorMsg {
         success: bool
     },
     TriggerSnapshot,
+    // Fix 1: Let the local Raft server verify actor responsiveness and cluster
+    // readiness through a non-mutating message with a bounded reply timeout.
+    Health {
+        reply_to: oneshot::Sender<HealthStatus>,
+    },
 }
 
 pub struct RaftActor {
@@ -100,8 +113,10 @@ pub struct RaftActor {
 }
 
 impl RaftActor {
+    // Fix 2: Keep the constructor signature used by the supplied tests while
+    // reconciling any completed snapshot with the separately persisted HardState.
     pub fn new(
-        state: RaftState, 
+        mut state: RaftState,
         inbox: mpsc::Receiver<ActorMsg>,
         msg_sender: mpsc::Sender<ActorMsg>,
         peers: HashMap<u64, RaftServiceClient>,
@@ -109,18 +124,102 @@ impl RaftActor {
         let mut state_machine = StateMachine::new();
         let snapshot_path = format!("snapshot_{}.json", state.my_id);
 
-        if let Ok(content) = std::fs::read_to_string(&snapshot_path) {
-            if let Ok(snapshot) = serde_json::from_str::<Snapshot>(&content) {
-                info!("Loaded snapshot from {} (last_included_index={})", snapshot_path, snapshot.last_included_index);
+        // Fix 2: Treat snapshot and HardState as one recoverable state. A newer
+        // atomic snapshot is adopted after a crash between the two replacements;
+        // an older or conflicting snapshot cannot safely reconstruct compacted data.
+        match std::fs::read_to_string(&snapshot_path) {
+            Ok(content) => {
+                let snapshot = serde_json::from_str::<Snapshot>(&content)
+                    .unwrap_or_else(|error| {
+                        panic!("Failed to deserialize required snapshot {}: {}", snapshot_path, error)
+                    });
+
+                if snapshot.last_included_index < state.last_included_index {
+                    panic!(
+                        "Snapshot {} is older than HardState ({} < {})",
+                        snapshot_path,
+                        snapshot.last_included_index,
+                        state.last_included_index
+                    );
+                }
+
+                if snapshot.last_included_index == state.last_included_index
+                    && snapshot.last_included_term != state.last_included_term
+                {
+                    panic!(
+                        "Snapshot {} conflicts with HardState term at index {}",
+                        snapshot_path,
+                        snapshot.last_included_index
+                    );
+                }
+
+                if snapshot.last_included_index > state.last_included_index {
+                    let mut retained_log: Vec<LogEntry> = state
+                        .log
+                        .iter()
+                        .filter(|entry| entry.index > snapshot.last_included_index)
+                        .cloned()
+                        .collect();
+                    retained_log.insert(
+                        0,
+                        LogEntry {
+                            term: snapshot.last_included_term,
+                            index: snapshot.last_included_index,
+                            command: Command::Ping,
+                        },
+                    );
+
+                    state.log = retained_log;
+                    state.last_included_index = snapshot.last_included_index;
+                    state.last_included_term = snapshot.last_included_term;
+                    state.commit_index = state.commit_index.max(snapshot.last_included_index);
+                    state.last_applied = state.last_applied.max(snapshot.last_included_index);
+
+                    RaftState::save_hs_to_disk(state.get_hs(), state.my_id)
+                        .unwrap_or_else(|error| {
+                            panic!("Failed to reconcile snapshot with HardState: {}", error)
+                        });
+                }
+
+                info!(
+                    "Loaded snapshot from {} (last_included_index={})",
+                    snapshot_path,
+                    snapshot.last_included_index
+                );
                 state_machine.data = snapshot.data;
-            } else {
-                warn!("Failed to deserialize snapshot from {}", snapshot_path);
             }
-        } else {
-            info!("No snapshot found at {}, starting with empty state machine.", snapshot_path);
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                if state.last_included_index > 0 {
+                    panic!(
+                        "HardState requires snapshot index {}, but {} is missing",
+                        state.last_included_index,
+                        snapshot_path
+                    );
+                }
+                info!("No snapshot found at {}, starting with empty state machine.", snapshot_path);
+            }
+            Err(error) => {
+                panic!("Failed to read snapshot {}: {}", snapshot_path, error);
+            }
         }
 
         Self { state, inbox, msg_sender, peers, state_machine, pending_requests: BTreeMap::new() }
+    }
+
+    // Fix 3: Atomically replace the snapshot file before publishing matching
+    // HardState, allowing startup reconciliation after interruption at either step.
+    async fn save_snapshot_to_disk(node_id: u64, data: Vec<u8>) -> Result<(), NodeError> {
+        spawn_blocking(move || {
+            let path = format!("snapshot_{}.json", node_id);
+            let tmp_path = format!("{}.tmp", path);
+            std::fs::write(&tmp_path, data)
+                .map_err(|error| NodeError::Internal(format!("Snapshot write error: {}", error)))?;
+            std::fs::rename(&tmp_path, &path)
+                .map_err(|error| NodeError::Internal(format!("Snapshot rename error: {}", error)))?;
+            Ok::<(), NodeError>(())
+        })
+        .await
+        .map_err(|error| NodeError::Internal(format!("Snapshot task join error: {}", error)))?
     }
 
     fn random_election_timeout() -> Duration {
@@ -144,6 +243,9 @@ impl RaftActor {
     pub async fn run(mut self) {
         let mut election_timer = interval(Self::random_election_timeout());
         election_timer.set_missed_tick_behavior(MissedTickBehavior::Skip);
+        // Fix 4: Tokio intervals tick immediately once; reset the election timer
+        // so all pods wait for their randomized timeout instead of campaigning together.
+        election_timer.reset();
         let mut heartbeat_timer = interval(Duration::from_millis(HEARTBEAT_INTERVAL));
         heartbeat_timer.set_missed_tick_behavior(MissedTickBehavior::Skip);
 
@@ -213,8 +315,19 @@ impl RaftActor {
                 self.handle_append_entries(term, leader_id, prev_log_index, prev_log_term, entries, leader_commit, reply_to, election_timer).await;
             }
             ActorMsg::AppendEntriesResult { peer_id, term, success, last_log_index } => {
+                // Fix 19: Persist a higher replication-response term before
+                // stepping down so restart cannot resume leadership in an old term.
                 if term > self.state.current_term {
                     self.state.become_follower(term);
+                    self.persist_state().await.unwrap_or_else(|error| {
+                        panic!("Failed to persist higher replication term: {}", error)
+                    });
+                    return;
+                }
+
+                // Fix 20: Ignore replies from older leader tasks or replies that
+                // arrive after this actor has already stepped down.
+                if term < self.state.current_term || self.state.role != Role::Leader {
                     return;
                 }
                 
@@ -239,6 +352,13 @@ impl RaftActor {
             }
             ActorMsg::TriggerSnapshot => {
                 self.handle_trigger_snapshot().await;
+            }
+            // Fix 1: Report readiness from actor-owned Raft state. A leader has
+            // won a quorum, while a ready follower has heard from a current leader.
+            ActorMsg::Health { reply_to } => {
+                let ready =
+                    self.state.role == Role::Leader || self.state.current_leader.is_some();
+                let _ = reply_to.send(HealthStatus { ready });
             }
         }
     }
@@ -265,18 +385,23 @@ impl RaftActor {
             data: snapshot_data
         };
 
-        // 3. Save to disk
+        // Fix 5: Serialize and atomically persist the complete committed snapshot
+        // before compacting its represented log prefix.
         let node_id = self.state.my_id;
-        let save_result = spawn_blocking(move || {
-            let path = format!("snapshot_{}.json", node_id);
-            let tmp_path = format!("{}.tmp", path);
-            let json = serde_json::to_string_pretty(&snapshot).map_err(|e| e.to_string())?;
-            std::fs::write(&tmp_path, json).map_err(|e| e.to_string())?;
-            std::fs::rename(&tmp_path, &path).map_err(|e| e.to_string())?;
-            Ok::<(), String>(())
-        }).await;
+        let snapshot_bytes = match serde_json::to_vec_pretty(&snapshot) {
+            Ok(bytes) => bytes,
+            Err(error) => {
+                error!("Failed to serialize snapshot: {}", error);
+                return;
+            }
+        };
 
-        if let Ok(Ok(())) = save_result {
+        // Fix 5: Leave the existing log untouched when the new snapshot cannot
+        // be stored, preserving the only recoverable copy of committed commands.
+        if Self::save_snapshot_to_disk(node_id, snapshot_bytes)
+            .await
+            .is_ok()
+        {
             info!("Snapshot saved successfully.");
             
             // 4. Truncate Log in Memory
@@ -298,7 +423,11 @@ impl RaftActor {
                 self.state.last_included_index = last_applied;
                 self.state.last_included_term = last_term;
                 
-                let _ = self.persist_state().await;
+                // Fix 6: Fail closed if the compacted HardState cannot follow
+                // the snapshot; restart reconciliation will safely adopt the snapshot.
+                self.persist_state()
+                    .await
+                    .unwrap_or_else(|error| panic!("Failed to persist compacted HardState: {}", error));
                 info!("Log truncated. New start index: {}", self.state.last_included_index);
             } else {
                 error!("Log truncation error: remove_count {} >= log.len {}", remove_count, self.state.log.len());
@@ -325,42 +454,87 @@ impl RaftActor {
             return;
         }
 
-        if term > self.state.current_term || self.state.role != Role::Leader {
+        // Fix 7: Persist a higher term before processing or rejecting the
+        // snapshot body so restart cannot resurrect an obsolete Raft term.
+        if term > self.state.current_term {
+            self.state.become_follower(term);
+            if let Err(error) = self.persist_state().await {
+                error!("Failed to persist higher InstallSnapshot term: {}", error);
+                let _ = reply_to.send(InstallSnapshotReply {
+                    term: self.state.current_term,
+                    success: false,
+                });
+                return;
+            }
+        } else if self.state.role != Role::Follower {
             self.state.become_follower(term);
         }
         
         self.state.current_leader = Some(leader_id);
         election_timer.reset();
 
-        // Decode Snapshot
-        if let Ok(snapshot) = serde_json::from_slice::<Snapshot>(&data) {
-             info!("Installing snapshot up to index {}", last_included_index);
-             
-             // Update State Machine
-             self.state_machine.data = snapshot.data;
+        // Fix 8: Reject malformed or metadata-inconsistent snapshots before
+        // replacing either the state machine or its durable snapshot.
+        let snapshot = match serde_json::from_slice::<Snapshot>(&data) {
+            Ok(snapshot)
+                if snapshot.last_included_index == last_included_index
+                    && snapshot.last_included_term == last_included_term =>
+            {
+                snapshot
+            }
+            Ok(_) => {
+                warn!("InstallSnapshot metadata does not match its serialized body");
+                let _ = reply_to.send(InstallSnapshotReply {
+                    term: self.state.current_term,
+                    success: false,
+                });
+                return;
+            }
+            Err(error) => {
+                warn!("Failed to deserialize snapshot data: {}", error);
+                let _ = reply_to.send(InstallSnapshotReply {
+                    term: self.state.current_term,
+                    success: false,
+                });
+                return;
+            }
+        };
 
-             // Update Log (Truncate)
-             // Discard entire log and reset from snapshot
-             
-             self.state.last_included_index = last_included_index;
-             self.state.last_included_term = last_included_term;
-             self.state.commit_index = last_included_index;
-             self.state.last_applied = last_included_index;
+        info!("Installing snapshot up to index {}", last_included_index);
 
-             // Create a new dummy entry at the snapshot index
-             let dummy_entry = LogEntry {
-                 term: last_included_term,
-                 index: last_included_index,
-                 command: Command::Ping // Placeholder
-             };
-             self.state.log = vec![dummy_entry];
-
-             let _ = self.persist_state().await;
-             let _ = reply_to.send(InstallSnapshotReply { term: self.state.current_term, success: true });
-        } else {
-            warn!("Failed to deserialize snapshot data");
-            let _ = reply_to.send(InstallSnapshotReply { term: self.state.current_term, success: false });
+        // Fix 9: Persist the received state-machine snapshot itself. HardState
+        // alone contains only the compacted log metadata and cannot recover KV data.
+        if let Err(error) = Self::save_snapshot_to_disk(self.state.my_id, data).await {
+            error!("Failed to persist installed snapshot: {}", error);
+            let _ = reply_to.send(InstallSnapshotReply {
+                term: self.state.current_term,
+                success: false,
+            });
+            return;
         }
+
+        self.state_machine.data = snapshot.data;
+        self.state.last_included_index = last_included_index;
+        self.state.last_included_term = last_included_term;
+        self.state.commit_index = last_included_index;
+        self.state.last_applied = last_included_index;
+        self.state.log = vec![LogEntry {
+            term: last_included_term,
+            index: last_included_index,
+            command: Command::Ping,
+        }];
+
+        // Fix 10: Acknowledge InstallSnapshot only after matching HardState is
+        // durable. On failure, stop immediately so startup reconciliation adopts
+        // the already durable snapshot instead of continuing with split state.
+        self.persist_state().await.unwrap_or_else(|error| {
+            panic!("Failed to persist installed snapshot HardState: {}", error)
+        });
+
+        let _ = reply_to.send(InstallSnapshotReply {
+            term: self.state.current_term,
+            success: true,
+        });
     }
     async fn handle_request_vote(
         &mut self,
@@ -394,7 +568,12 @@ impl RaftActor {
             debug!("Vote DENIED for candidate {}. Reason: Term too old ({} < {})", candidate_id, term, self.state.current_term);
         }
 
-        let _ = self.persist_state().await;
+        // Fix 11: Never acknowledge a vote that was not durably recorded;
+        // otherwise a pod restart could vote twice in the same term.
+        if let Err(error) = self.persist_state().await {
+            error!("Failed to persist RequestVote state: {}", error);
+            vote_granted = false;
+        }
         let _ = reply_to.send(RequestVoteReply { term: self.state.current_term, vote_granted });
     }
 
@@ -423,8 +602,15 @@ impl RaftActor {
         self.state.current_leader = Some(leader_id);
         election_timer.reset();
 
-        let success = self.state.append_entries(prev_log_index, prev_log_term, entries);
-        let _ = self.persist_state().await;
+        // Fix 12: Keep the pre-RPC log so a failed durable write can reject the
+        // append without leaving an acknowledged entry only in volatile memory.
+        let previous_log = self.state.log.clone();
+        let mut success = self.state.append_entries(prev_log_index, prev_log_term, entries);
+        if let Err(error) = self.persist_state().await {
+            error!("Failed to persist AppendEntries state: {}", error);
+            self.state.log = previous_log;
+            success = false;
+        }
 
         if success {
             if leader_commit > self.state.commit_index {
@@ -452,9 +638,28 @@ impl RaftActor {
             let physical_idx = (idx - self.state.last_included_index) as usize;
 
             if physical_idx < log_len {
-                let entry = &self.state.log[physical_idx];
-                let result = self.state_machine.apply(&entry.command);
-                info!("Applied log index {}: {:?} -> {}", idx, entry.command, result);
+                // Fix 13: Apply committed membership commands to every Raft
+                // node's live membership, not only to the accepting leader.
+                let command = self.state.log[physical_idx].command.clone();
+                let membership_changed = match &command {
+                    Command::AddNode { id, address } => {
+                        self.state.peers.insert(*id, address.clone()).as_ref()
+                            != Some(address)
+                    }
+                    Command::RemoveNode { id } => self.state.peers.remove(id).is_some(),
+                    _ => false,
+                };
+
+                let result = self.state_machine.apply(&command);
+                info!("Applied log index {}: {:?} -> {}", idx, command, result);
+
+                // Fix 13: Persist follower membership at the same committed log
+                // index so a replacement pod cannot forget a completed AddNode.
+                if membership_changed {
+                    self.persist_state().await.unwrap_or_else(|error| {
+                        panic!("Failed to persist committed membership: {}", error)
+                    });
+                }
 
                 if let Some(sender) = self.pending_requests.remove(&idx) {
                     let _ = sender.send(Ok(result));
@@ -471,9 +676,43 @@ impl RaftActor {
     }
 
     /* Internal Logic */
+    // Fix 14: Reconnect configured DNS peers before an election so startup
+    // ordering or an earlier disconnect cannot prevent a surviving quorum voting.
+    async fn reconnect_missing_peers(&mut self) {
+        let configured_peers = self.state.peers.clone();
+        for (peer_id, peer_addr) in configured_peers {
+            if peer_id == self.state.my_id || self.peers.contains_key(&peer_id) {
+                continue;
+            }
+
+            let connection = tokio::time::timeout(
+                Duration::from_millis(1000),
+                tarpc::serde_transport::tcp::connect(peer_addr.as_str(), Json::default),
+            )
+            .await;
+
+            if let Ok(Ok(transport)) = connection {
+                let peer_client =
+                    RaftServiceClient::new(client::Config::default(), transport).spawn();
+                self.peers.insert(peer_id, peer_client);
+                info!("Connected to peer {} before election", peer_id);
+            }
+        }
+    }
+
     async fn start_election(&mut self) {
         self.state.become_candidate(); 
-        let _ = self.persist_state().await; 
+        // Fix 15: Persist the incremented term and self-vote before requesting
+        // external votes so a restart cannot reuse the term or vote twice.
+        if let Err(error) = self.persist_state().await {
+            error!("Cannot start election because self-vote was not persisted: {}", error);
+            self.state.become_follower(self.state.current_term);
+            return;
+        }
+
+        // Fix 14: Refresh missing outbound clients while the candidate still
+        // has time to satisfy the sub-ten-second leader-transition requirement.
+        self.reconnect_missing_peers().await;
 
         let term = self.state.current_term;
         let my_id = self.state.my_id;
@@ -484,6 +723,12 @@ impl RaftActor {
         let (tx, mut rx): (mpsc::Sender<(u64, RequestVoteReply)>, mpsc::Receiver<(u64, RequestVoteReply)>) = mpsc::channel(self.peers.len().max(1)); 
 
         for (peer_id, client) in &self.peers {
+            // Fix 16: The candidate already counted its durable self-vote and
+            // must never send RequestVote to its own RPC endpoint.
+            if *peer_id == my_id {
+                continue;
+            }
+
             let client = client.clone();
             let tx_inner = tx.clone();
             let peer_id = *peer_id;
@@ -503,13 +748,30 @@ impl RaftActor {
         drop(tx); 
 
         let mut votes_received = 1;
-        let majority = (self.state.peers.len() + 1) / 2 + 1;
+        // Fix 17: Count the local member exactly once so quorum is two of three
+        // and three of five whether the peer map includes self or not.
+        let local_member_missing =
+            if self.state.peers.contains_key(&self.state.my_id) { 0 } else { 1 };
+        let cluster_size = self.state.peers.len() + local_member_missing;
+        let majority = cluster_size / 2 + 1;
+
+        // Fix 17: Permit the already-durable self-vote to elect a one-node test
+        // cluster without waiting on an empty response channel.
+        if votes_received >= majority {
+            self.state.become_leader();
+            self.send_heartbeats().await;
+            return;
+        }
 
         while let Some((peer_id, reply)) = rx.recv().await {
             if reply.term > term {
                 warn!("Peer {} has higher term ({}). Stepping down.", peer_id, reply.term);
                 self.state.become_follower(reply.term);
-                let _ = self.persist_state().await;
+                // Fix 18: Persist the higher election term before returning to
+                // follower operation so pod restart cannot revive an obsolete term.
+                self.persist_state().await.unwrap_or_else(|error| {
+                    panic!("Failed to persist higher election term: {}", error)
+                });
                 return;
             }
 
@@ -551,23 +813,29 @@ impl RaftActor {
                 let snapshot_path = format!("snapshot_{}.json", my_id);
 
                 tokio::spawn(async move {
-                    let client = match existing_client {
-                        Some(c) => c,
-                        None => {
-                             if let Ok(addr) = peer_addr_str.parse::<SocketAddr>() {
-                                match tokio::time::timeout(Duration::from_millis(HEARTBEAT_INTERVAL), tarpc::serde_transport::tcp::connect(addr, Json::default)).await {
-                                    Ok(Ok(transport)) => {
-                                        let new_client = RaftServiceClient::new(client::Config::default(), transport).spawn();
-                                        let _ = sender.send(ActorMsg::UpdatePeerClient { node_id: peer_id, client: new_client.clone() }).await;
-                                        new_client
-                                    }
-                                    _ => return,
-                                }
-                            } else {
-                                return;
-                            }
-                        }
-                    };
+	                    let client = match existing_client {
+	                        Some(c) => c,
+	                        None => {
+	                            // Fix 21: Pass the Headless Service hostname
+	                            // directly to tarpc instead of rejecting DNS as SocketAddr.
+	                            match tokio::time::timeout(
+	                                Duration::from_millis(HEARTBEAT_INTERVAL),
+	                                tarpc::serde_transport::tcp::connect(
+	                                    peer_addr_str.as_str(),
+	                                    Json::default,
+	                                ),
+	                            )
+	                            .await
+	                            {
+	                                Ok(Ok(transport)) => {
+	                                    let new_client = RaftServiceClient::new(client::Config::default(), transport).spawn();
+	                                    let _ = sender.send(ActorMsg::UpdatePeerClient { node_id: peer_id, client: new_client.clone() }).await;
+	                                    new_client
+	                                }
+	                                _ => return,
+	                            }
+	                        }
+	                    };
 
                     // Read snapshot from disk
                     let data = match tokio::fs::read(&snapshot_path).await {
@@ -622,28 +890,34 @@ impl RaftActor {
                 let last_idx_sent = prev_log_index + entries.len() as u64;
 
                 tokio::spawn(async move {
-                    let client = match existing_client {
-                        Some(c) => c,
-                        None => {
-                            info!("[Heartbeat] Peer {} disconnected, attempting to reconnect to {}...", peer_id, peer_addr_str);
-                            if let Ok(addr) = peer_addr_str.parse::<SocketAddr>() {
-                                match tokio::time::timeout(Duration::from_millis(HEARTBEAT_INTERVAL), tarpc::serde_transport::tcp::connect(addr, Json::default)).await {
-                                    Ok(Ok(transport)) => {
-                                        let new_client = RaftServiceClient::new(client::Config::default(), transport).spawn();
-                                        info!("[Heartbeat] Successfully reconnected to peer {}", peer_id);
-                                        let _ = sender.send(ActorMsg::UpdatePeerClient { node_id: peer_id, client: new_client.clone() }).await;
-                                        new_client
-                                    }
-                                    _ => {
-                                        debug!("[Heartbeat] Failed to reconnect to peer {}", peer_id);
-                                        return;
-                                    }
-                                }
-                            } else {
-                                return;
-                            }
-                        }
-                    };
+	                    let client = match existing_client {
+	                        Some(c) => c,
+	                        None => {
+	                            info!("[Heartbeat] Peer {} disconnected, attempting to reconnect to {}...", peer_id, peer_addr_str);
+	                            // Fix 21: Reconnect AppendEntries through the
+	                            // configured DNS string so pod replacement remains reachable.
+	                            match tokio::time::timeout(
+	                                Duration::from_millis(HEARTBEAT_INTERVAL),
+	                                tarpc::serde_transport::tcp::connect(
+	                                    peer_addr_str.as_str(),
+	                                    Json::default,
+	                                ),
+	                            )
+	                            .await
+	                            {
+	                                Ok(Ok(transport)) => {
+	                                    let new_client = RaftServiceClient::new(client::Config::default(), transport).spawn();
+	                                    info!("[Heartbeat] Successfully reconnected to peer {}", peer_id);
+	                                    let _ = sender.send(ActorMsg::UpdatePeerClient { node_id: peer_id, client: new_client.clone() }).await;
+	                                    new_client
+	                                }
+	                                _ => {
+	                                    debug!("[Heartbeat] Failed to reconnect to peer {}", peer_id);
+	                                    return;
+	                                }
+	                            }
+	                        }
+	                    };
                     
                     let mut context = tarpc::context::current();
                     context.deadline = std::time::Instant::now() + Duration::from_millis(1000);
@@ -682,7 +956,15 @@ impl RaftActor {
         self.pending_requests.insert(new_index, reply_to);
 
         info!("Leader appended command to log index {}", new_index);
-        let _ = self.persist_state().await;
+        // Fix 22: Do not replicate or acknowledge a leader entry that failed
+        // durable storage; roll back its volatile log and pending response.
+        if let Err(error) = self.persist_state().await {
+            self.state.log.pop();
+            if let Some(sender) = self.pending_requests.remove(&new_index) {
+                let _ = sender.send(Err(error));
+            }
+            return;
+        }
         self.send_heartbeats().await;
 
         // Try to advance commit index immediately (important for single-node clusters)
@@ -731,17 +1013,20 @@ impl RaftActor {
         };
         self.state.log.push(entry);
     
-        let _ = self.persist_state().await;
-
-        let node_addr_parsed: SocketAddr = match node_addr.parse() {
-            Ok(a) => a,
-            Err(_) => {
-                let _ = reply_to.send(Err(NodeError::Internal("Invalid Address".into())));
-                return;
-            }
-        };
+        // Fix 23: Roll back every volatile AddNode mutation when membership and
+        // its log entry cannot be persisted as one recoverable HardState.
+        if let Err(error) = self.persist_state().await {
+            self.state.peers.remove(&node_id);
+            self.state.next_index.remove(&node_id);
+            self.state.match_index.remove(&node_id);
+            self.state.log.pop();
+            let _ = reply_to.send(Err(error));
+            return;
+        }
         
-        match tarpc::serde_transport::tcp::connect(node_addr_parsed, Json::default).await {
+        // Fix 24: Connect to a joining pod through its ConfigMap-provided DNS
+        // string instead of requiring a numeric SocketAddr.
+        match tarpc::serde_transport::tcp::connect(node_addr.as_str(), Json::default).await {
             Ok(transport) => {
                 let client = RaftServiceClient::new(client::Config::default(), transport).spawn();
                 self.peers.insert(node_id, client);
@@ -750,10 +1035,18 @@ impl RaftActor {
             Err(e) => {
                 warn!("Failed to connect to new peer {}: {}", node_id, e);
                 let msg_sender = self.msg_sender.clone();
+                // Fix 24: Preserve the owned DNS name for background retries
+                // after the new StatefulSet pod becomes reachable.
+                let retry_addr = node_addr.clone();
                 tokio::spawn(async move {
                     loop {
                         tokio::time::sleep(Duration::from_secs(1)).await;
-                        if let Ok(transport) = tarpc::serde_transport::tcp::connect(node_addr_parsed, Json::default).await {
+                        if let Ok(transport) = tarpc::serde_transport::tcp::connect(
+                            retry_addr.as_str(),
+                            Json::default,
+                        )
+                        .await
+                        {
                             let client = RaftServiceClient::new(client::Config::default(), transport).spawn();
                             let _ = msg_sender.send(ActorMsg::UpdatePeerClient { node_id, client }).await;
                             break;
@@ -793,10 +1086,12 @@ impl RaftActor {
         }
 
         info!("Removing node {} from cluster", node_id);
-        self.state.peers.remove(&node_id);
-        self.state.next_index.remove(&node_id);
-        self.state.match_index.remove(&node_id);
-        self.peers.remove(&node_id);
+        // Fix 25: Retain removed membership and client values until the removal
+        // log entry is durable, so failure can restore the complete prior state.
+        let removed_addr = self.state.peers.remove(&node_id);
+        let removed_next_index = self.state.next_index.remove(&node_id);
+        let removed_match_index = self.state.match_index.remove(&node_id);
+        let removed_client = self.peers.remove(&node_id);
 
         let new_index = self.state.last_log_index() + 1;
         let entry = LogEntry {
@@ -805,13 +1100,33 @@ impl RaftActor {
             command: Command::RemoveNode { id: node_id },
         };
         self.state.log.push(entry);
-        let _ = self.persist_state().await;
+
+        // Fix 25: Acknowledge RemoveNode only after its membership mutation and
+        // log entry are durable; otherwise restore every removed value.
+        if let Err(error) = self.persist_state().await {
+            if let Some(address) = removed_addr {
+                self.state.peers.insert(node_id, address);
+            }
+            if let Some(index) = removed_next_index {
+                self.state.next_index.insert(node_id, index);
+            }
+            if let Some(index) = removed_match_index {
+                self.state.match_index.insert(node_id, index);
+            }
+            if let Some(client) = removed_client {
+                self.peers.insert(node_id, client);
+            }
+            self.state.log.pop();
+            let _ = reply_to.send(Err(error));
+            return;
+        }
         self.send_heartbeats().await;
         let _ = reply_to.send(Ok(()));
     }
 
     pub async fn bootstrap(&mut self, contact_node_address: String) -> anyhow::Result<()> {
-        let initial_addr: SocketAddr = contact_node_address.parse()?;
+        // Fix 26: Accept the injected contact address as DNS-capable text from
+        // the start of bootstrap instead of parsing it into SocketAddr.
         const MAX_RETRIES: u32 = 3;
 
         let my_id = self.state.my_id;
@@ -824,10 +1139,22 @@ impl RaftActor {
             }
         };
 
-        match execute_with_redirect(initial_addr, MAX_RETRIES, rpc_call).await {
+        // Fix 26: Keep the bootstrap contact as a DNS-capable string so a new
+        // StatefulSet pod can join through the Headless Service.
+        match execute_with_redirect(contact_node_address, MAX_RETRIES, rpc_call).await {
             Ok(join_response) => {
                 info!("Successfully joined the cluster. Updating peer list.");
+                // Fix 27: Preserve the previous membership until the leader's
+                // returned cluster configuration is durable on this new pod.
+                let previous_peers = self.state.peers.clone();
                 self.state.peers = join_response.peers;
+                if let Err(error) = self.persist_state().await {
+                    self.state.peers = previous_peers;
+                    return Err(anyhow::anyhow!(
+                        "Failed to persist bootstrap membership: {}",
+                        error
+                    ));
+                }
                 info!("Updated peer list from leader: {:?}", self.state.peers);
                 Ok(())
             }

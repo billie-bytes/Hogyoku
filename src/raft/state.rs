@@ -17,6 +17,12 @@ pub struct HardState {
     log: Vec<LogEntry>,
     last_included_index: u64,
     last_included_term: u64,
+    /*
+    Fix 1: Save peers agar tidak hilang saat node restart
+    atau crash dan join lagi
+    */
+    #[serde(default)]
+    peers: HashMap<u64, String>,
 }
 
 pub struct RaftState {
@@ -47,12 +53,24 @@ pub struct RaftState {
 
 impl RaftState {
     pub fn new(id: u64, peers: HashMap<u64, String>) -> Self {
+        let advertised_addr = peers.get(&id).cloned().unwrap_or_default();
+        Self::new_with_addr(id, peers, advertised_addr)
+    }
+    /*
+    Fix 2: Constructor baru untuk advertised address non-default
+    yang akan diinject melalui configmap
+    */ 
+    pub fn new_with_addr(
+        id: u64,
+        peers: HashMap<u64, String>,
+        advertised_addr: String,
+    ) -> Self {
         let storage_path = format!("node_{}.json", id);
         if Path::new(&storage_path).exists() {
             match Self::load_hs(&storage_path) {
                 Ok(hs) => {
                     info!("Loaded persistent state from {}", storage_path);
-                    return Self::restore(id, peers, hs);
+                    return Self::restore(id, peers, advertised_addr, hs);
                 }
                 Err(e) => {
                     panic!(
@@ -83,13 +101,11 @@ impl RaftState {
             match_index: HashMap::new(),
             peers,
             my_id: id,
-            /*Fix 1: 
-            with the previous IP of 127.0.0.1 the other nodes will see
-            "Oh, that guys address is 127.0.0.1" which is fatal since
-            that IP is for localhost. And now when that node want to 
-            communicate to this node, it goes to 127.0.0.1 which is itself
+            /*
+            Fix 3: sekarang my_addr menggunakan advertised address yang
+            didefinisikan di awal konstruktor
             */
-            my_addr: format!("raft-{}.raft-svc.raft-system.svc.cluster.local:8000", id - 1),
+            my_addr: advertised_addr,
             last_included_index: 0,
             last_included_term: 0,
         }
@@ -311,9 +327,12 @@ impl RaftState {
             .map_err(|e| NodeError::Internal(format!("Deserialize error: {}", e)))
     }
 
+    // Fix 4: Restore durable membership alongside log state, falling back to
+    // ConfigMap membership only for pre-fix HardState files.
     fn restore(
         id: u64,
-        peers: HashMap<u64, String>,
+        configured_peers: HashMap<u64, String>,
+        advertised_addr: String,
         hs: HardState
     ) -> Self {
         // If we have a snapshot, log[0] is the snapshot placeholder
@@ -331,6 +350,19 @@ impl RaftState {
             hs.log
         };
 
+        /*
+        Fix 4: dalam hardstate sekarang sudah ada peers
+        namun sebelum ada fix 1, hardstate tidak memiliki peers.
+        Ini fix untuk compatibility. Apabila dalam hardstate tidak
+        ada peers diasumsikan hardstate berasal dari versi
+        pre-fix, dan untuk versi itu default ke configured_peers
+        */
+        let restored_peers = if hs.peers.is_empty() {
+            configured_peers
+        } else {
+            hs.peers
+        };
+
         Self {
             current_term: hs.current_term,
             voted_for: hs.voted_for,
@@ -341,9 +373,13 @@ impl RaftState {
             role: Role::Follower,
             next_index: HashMap::new(),
             match_index: HashMap::new(),
-            peers,
+            peers: restored_peers,
             my_id: id,
-            my_addr: format!("raft-{}.raft-svc.raft-system.svc.cluster.local:8000", id - 1),
+            /*
+            Fix 3: sekarang my_addr menggunakan advertised address yang
+            didefinisikan di awal konstruktor
+            */
+            my_addr: advertised_addr,
             last_included_index: hs.last_included_index,
             last_included_term: hs.last_included_term,
         }
@@ -356,6 +392,11 @@ impl RaftState {
             log: self.log.clone(),
             last_included_index: self.last_included_index,
             last_included_term: self.last_included_term,
+            /*
+            Fix 1: ini fix yang sama dengan fix 1 di awal. Peers akan disave
+            sesuai dengan keadaan up-to-date pada memory
+            */
+            peers: self.peers.clone(),
         }
     }
 }
