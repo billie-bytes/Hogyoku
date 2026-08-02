@@ -1,5 +1,13 @@
 use std::net::SocketAddr;
 
+// Fix 1: Add a Raft-local, actor-aware HTTP probe interface on the server
+// binary only; this does not modify the API Gateway or its HTML.
+use axum::{
+    extract::State,
+    http::StatusCode,
+    routing::get,
+    Router,
+};
 use clap::Parser;
 use raft_core::domain::{Command, LogEntry};
 use raft_core::error::NodeError;
@@ -8,7 +16,9 @@ use futures::StreamExt;
 use tarpc::server::{self, Channel};
 use tarpc::{context, tokio_serde::formats::Json};
 use tokio::sync::{mpsc, oneshot};
-use raft_core::raft::actor::{RaftActor, ActorMsg};
+// Fix 1: Import the actor health message alongside existing Raft messages so
+// probes verify the actor rather than merely checking an open TCP socket.
+use raft_core::raft::actor::{ActorMsg, RaftActor};
 use raft_core::raft::state::RaftState;
 use std::time::Duration;
 use tracing_subscriber::EnvFilter;
@@ -26,13 +36,56 @@ struct Args {
     id: u64,
     #[arg(long, default_value = "")]
     peers: String,
+    // Fix 2: Require the ConfigMap-resolved address that peers and redirects
+    // must use instead of reconstructing Kubernetes DNS inside RaftState.
+    #[arg(long)]
+    advertise_addr: String,
     #[arg(long)]
     contact_node_address: Option<String>,
+    // Fix 1: Reserve a separate internal port for Kubernetes health probes so
+    // the API Gateway and Raft RPC protocols remain unchanged.
+    #[arg(long, default_value_t = 8081)]
+    health_port: u16,
 }
 
 #[derive(Clone, Debug)]
 struct RaftNodeHandle {
     tx: mpsc::Sender<ActorMsg>
+}
+
+// Fix 1: Share only the local actor channel with health routes; probes never
+// execute replicated commands and therefore cannot grow the Raft log.
+#[derive(Clone)]
+struct HealthAppState {
+    tx: mpsc::Sender<ActorMsg>,
+}
+
+// Fix 1: Treat the node as live only when the Raft actor answers within a
+// bounded interval, which detects an unresponsive actor behind an open socket.
+async fn health_live(State(state): State<HealthAppState>) -> StatusCode {
+    let (reply_to, reply) = oneshot::channel();
+    if state.tx.send(ActorMsg::Health { reply_to }).await.is_err() {
+        return StatusCode::SERVICE_UNAVAILABLE;
+    }
+
+    match tokio::time::timeout(Duration::from_secs(1), reply).await {
+        Ok(Ok(_)) => StatusCode::OK,
+        _ => StatusCode::SERVICE_UNAVAILABLE,
+    }
+}
+
+// Fix 1: Mark the pod ready only after it wins leadership or hears from a
+// current leader, exactly matching the cluster-connection readiness requirement.
+async fn health_ready(State(state): State<HealthAppState>) -> StatusCode {
+    let (reply_to, reply) = oneshot::channel();
+    if state.tx.send(ActorMsg::Health { reply_to }).await.is_err() {
+        return StatusCode::SERVICE_UNAVAILABLE;
+    }
+
+    match tokio::time::timeout(Duration::from_secs(1), reply).await {
+        Ok(Ok(status)) if status.ready => StatusCode::OK,
+        _ => StatusCode::SERVICE_UNAVAILABLE,
+    }
 }
 
 impl RaftService for RaftNodeHandle {
@@ -258,14 +311,14 @@ async fn main() -> anyhow::Result<()> {
     tracing::info!("Peers Config: {:?}", peers_map);
     let mut rpc_clients = std::collections::HashMap::new();
     for (id, addr_str) in &peers_map {
-        // FIX 1: The local node already participates directly and must not get
+        // Fix 3: The local node already participates directly and must not get
         // an RPC client to itself, which could produce a duplicate self-vote.
         if *id == args.id {
             continue;
         }
 
         tracing::info!("Connecting to peer {} at {}...", id, addr_str);
-        // FIX 2: Pass ConfigMap addresses directly to tarpc so Headless Service
+        // Fix 4: Pass ConfigMap addresses directly to tarpc so Headless Service
         // DNS names work during initial peer discovery.
         if let Ok(transport) =
             tarpc::serde_transport::tcp::connect(addr_str.as_str(), Json::default).await
@@ -279,19 +332,50 @@ async fn main() -> anyhow::Result<()> {
     }
 
     // --- 4. Create Actor and Bootstrap (in foreground) ---
-    // FIX 3: Propagate fail-closed HardState/snapshot recovery errors so a pod
-    // never starts as a fresh node after losing access to persisted state.
-    let state = RaftState::new(args.id, peers_map.clone())?;
-    let mut actor = RaftActor::new(state, rx, tx, rpc_clients)?;
+    // Fix 5: Use the ConfigMap-derived advertised address while preserving the
+    // value-returning constructor API required by the supplied tests.
+    let state = RaftState::new_with_addr(
+        args.id,
+        peers_map.clone(),
+        args.advertise_addr,
+    );
 
-    if let Some(contact_node_address) = args.contact_node_address {
+    // Fix 6: A fresh scaled pod is absent from initial membership, whereas an
+    // initial or durably rejoined pod already contains its own ID.
+    let needs_bootstrap = !state.peers.contains_key(&args.id);
+    let mut actor = RaftActor::new(state, rx, tx.clone(), rpc_clients);
+
+    // Fix 6: Bootstrap only a genuinely new member, avoiding unnecessary join
+    // failure when an existing PVC-backed member restarts.
+    if needs_bootstrap {
+        let contact_node_address = args.contact_node_address.ok_or_else(|| {
+            anyhow::anyhow!("A new node requires --contact-node-address")
+        })?;
         tracing::info!("Bootstrapping to {}", contact_node_address);
         if let Err(e) = actor.bootstrap(contact_node_address).await {
             tracing::error!("Bootstrap failed: {}. Shutting down.", e);
-            return Ok(());
+            // Fix 6: Return bootstrap failure to the container runtime so
+            // Kubernetes retries instead of treating an unjoined exit as success.
+            return Err(e);
         }
         tracing::info!("Bootstrap successful.");
     }
+
+    // Fix 1: Start the private health listener immediately before the actor loop;
+    // both endpoints remain unavailable until the actor can process their messages.
+    let health_addr = SocketAddr::new("0.0.0.0".parse()?, args.health_port);
+    let health_state = HealthAppState { tx: tx.clone() };
+    let health_app = Router::new()
+        .route("/health/live", get(health_live))
+        .route("/health/ready", get(health_ready))
+        .with_state(health_state);
+    let health_listener = tokio::net::TcpListener::bind(health_addr).await?;
+    tokio::spawn(async move {
+        tracing::info!("Health server listening on {}", health_addr);
+        if let Err(error) = axum::serve(health_listener, health_app).await {
+            tracing::error!("Health server stopped: {}", error);
+        }
+    });
 
     // --- 5. Run Actor's main loop (blocks forever) ---
     tracing::info!("Starting actor main loop.");

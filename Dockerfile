@@ -18,6 +18,11 @@ COPY --from=builder /app/target/release/api_gateway /usr/local/bin/api_gateway
 COPY docker-entrypoint.sh /usr/local/bin/docker-entrypoint.sh
 RUN chmod +x /usr/local/bin/docker-entrypoint.sh
 
+# Fix 1: Activate the runtime entrypoint so every Raft container resolves its
+# ConfigMap-injected identity and addresses before starting the server.
+ENTRYPOINT ["/usr/local/bin/docker-entrypoint.sh"]
+CMD ["server"]
+
 # How good is this compared to the previous docker?
 #
 # Sebelumnya tiap docker container punya ubuntu image (huge) and also 

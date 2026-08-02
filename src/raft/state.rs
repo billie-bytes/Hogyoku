@@ -52,6 +52,7 @@ pub struct RaftState {
 }
 
 impl RaftState {
+    
     pub fn new(id: u64, peers: HashMap<u64, String>) -> Self {
         let advertised_addr = peers.get(&id).cloned().unwrap_or_default();
         Self::new_with_addr(id, peers, advertised_addr)
